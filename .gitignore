@@ -1,2 +1,6 @@
 env_projet_10/
 data/
+.vscode/
+model_cf.pkl
+model_cb.pkl
+data_transform.pkl
