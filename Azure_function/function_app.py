@@ -70,10 +70,6 @@ def predict_cf_knn_scores_subset(user_id: int, k_neighbors: int = 5) -> np.ndarr
         neighbor_indices.remove(user_idx)
     neighbor_indices = neighbor_indices[:k_neighbors]
 
-    print("neighbor_indices:", neighbor_indices)
-    for n in neighbor_indices:
-        nb_clics_voisin = sparse_matrix[n].sum()
-
     neighbors_matrix = sparse_matrix[neighbor_indices]
     scores_subset = neighbors_matrix.sum(axis=0).A1
 
@@ -182,30 +178,23 @@ def recommend_function(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse("Missing user_id", status_code=400)
         user_id = int(user_id_str)
 
+        # Vérification si user_id existe
+        if user_id not in user_id_to_index and user_id not in user_profiles:
+            return func.HttpResponse(
+                json.dumps({"error": f"L'utilisateur {user_id} est inconnu."}),
+                status_code=404,
+                mimetype="application/json"
+            )
+
         # alpha
         alpha_str = req.params.get('alpha')
         alpha = float(alpha_str) if alpha_str else 0.5
 
-        # debug param
-        debug_str = req.params.get('debug')
-        debug_mode = (debug_str == "1")
-
         # Calcul
-        if debug_mode:
-            # On veut aussi le détail des scores
-            recommendations_data = predict_hybrid_recos(user_id, alpha=alpha, top_n=5, return_scores=True)
-            response_data = {
-                "user_id": user_id,
-                "alpha": alpha,
-                "recommendations_debug": recommendations_data
-            }
-        else:
-            # Juste la liste
-            final_recos = predict_hybrid_recos(user_id, alpha=alpha, top_n=5, return_scores=False)
-            response_data = {
-                "user_id": user_id,
-                "alpha": alpha,
-                "recommendations": final_recos
+        final_recos = predict_hybrid_recos(user_id, alpha=alpha, top_n=5, return_scores=False)
+        response_data = {
+            "user_id": user_id,
+            "recommendations": final_recos
             }
 
         return func.HttpResponse(
