@@ -1,6 +1,12 @@
 {
   "version": "2.0",
   "logging": {
+    "logLevel": {
+      "default": "Information",
+      "Host.Triggers": "Trace",
+      "Function": "Information",
+      "Function.recommend_function": "Trace"
+    },
     "applicationInsights": {
       "samplingSettings": {
         "isEnabled": true,

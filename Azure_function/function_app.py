@@ -8,22 +8,44 @@ from azure.functions.decorators import FunctionApp, AuthLevel
 
 import pickle
 import numpy as np
-from typing import List
 from sklearn.metrics.pairwise import cosine_similarity
+from azure.storage.blob import BlobServiceClient
+import tempfile
 
 # Instanciation de la FunctionApp (v2)
 app = FunctionApp()
 
-# Chargement des modèles / artefacts au démarrage
-BASE_PATH = os.path.dirname(__file__)
+# Configuration du Blob Storage
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+CONTAINER_NAME = "recommendation-files"
 
-with open(os.path.join(BASE_PATH, 'model_cf.pkl'), 'rb') as f:
+# Initialisation du client Azure Blob Storage
+if AZURE_STORAGE_CONNECTION_STRING is None:
+    raise ValueError("AZURE_STORAGE_CONNECTION_STRING n'est pas défini dans les variables d'environnement.")
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+
+def download_blob(blob_name):
+    """
+    Télécharge un fichier depuis Azure Blob Storage et le stocke temporairement.
+    """
+    blob_client = container_client.get_blob_client(blob_name)
+    temp_file = tempfile.NamedTemporaryFile(delete=False)  # Fichier temporaire
+    with open(temp_file.name, "wb") as f:
+        f.write(blob_client.download_blob().readall())
+    return temp_file.name
+
+# Chargement des modèles et des artefacts depuis Blob Storage
+model_cf_path = download_blob('model_cf.pkl')
+with open(model_cf_path, 'rb') as f:
     model_cf = pickle.load(f)
 
-with open(os.path.join(BASE_PATH, 'model_cb.pkl'), 'rb') as f:
+model_cb_path = download_blob('model_cb.pkl')
+with open(model_cb_path, 'rb') as f:
     model_cb = pickle.load(f)
 
-with open(os.path.join(BASE_PATH, 'data_transform.pkl'), 'rb') as f:
+data_transform_path = download_blob('data_transform.pkl')
+with open(data_transform_path, 'rb') as f:
     data_transform = pickle.load(f)
 
 # Raccourcis CF
@@ -93,13 +115,30 @@ def expand_cf_scores(scores_subset: np.ndarray) -> np.ndarray:
 def predict_cb_scores(user_id: int) -> np.ndarray:
     """
     Score CB (similarité) sur l'ensemble (364047 articles).
+    Optimisé avec :
+      - Réduction mémoire (float16)
+      - Calcul en batchs pour éviter le dépassement mémoire
     """
+    # Conversion en float16 pour réduire la mémoire
+    global articles_embeddings
+    articles_embeddings = articles_embeddings.astype(np.float16)
+
     scores_cb = np.zeros(NUM_ARTICLES_GLOBAL, dtype=np.float32)
+
     if user_id not in user_profiles:
         return scores_cb
-    user_emb = user_profiles[user_id].reshape(1, -1)
-    sims = cosine_similarity(user_emb, articles_embeddings)[0]
-    scores_cb = sims.astype(np.float32)
+
+    user_emb = user_profiles[user_id].reshape(1, -1).astype(np.float16)
+
+    # Taille du batch (10 000 articles par batch pour éviter la surcharge mémoire)
+    batch_size = 10000
+    num_batches = int(np.ceil(articles_embeddings.shape[0] / batch_size))
+
+    for i in range(num_batches):
+        start = i * batch_size
+        end = min(start + batch_size, articles_embeddings.shape[0])
+        sims = cosine_similarity(user_emb, articles_embeddings[start:end])[0]
+        scores_cb[start:end] = sims.astype(np.float32)
     return scores_cb
 
 # Fonction de prédiction hybride
@@ -117,68 +156,64 @@ def predict_hybrid_recos(user_id: int, alpha: float = 0.5, top_n: int = 5, retur
     Si return_scores=True, on retourne en plus la décomposition des scores 
     pour chaque article recommandé.
     """
-    scores_cf_subset = predict_cf_knn_scores_subset(user_id, k_neighbors=5)
-    scores_cf = expand_cf_scores(scores_cf_subset)  # shape(364047,)
-    scores_cb = predict_cb_scores(user_id)          # shape(364047,)
+    try:
+        scores_cf_subset = predict_cf_knn_scores_subset(user_id, k_neighbors=5)
+        scores_cf = expand_cf_scores(scores_cf_subset)  # shape(364047,)
+        scores_cb = predict_cb_scores(user_id)          # shape(364047,)
 
-    # Exclure articles déjà vus en CB
-    if user_id in user_id_to_index:
-        user_idx = user_id_to_index[user_id]
-        user_vector = sparse_matrix[user_idx]
-        already_viewed = user_vector.indices
-        for col_idx in already_viewed:
-            art_global_id = article_ids_cf[col_idx]
-            if 0 <= art_global_id < NUM_ARTICLES_GLOBAL:
-                scores_cb[art_global_id] = -9999
+        # Exclure articles déjà vus en CB
+        if user_id in user_id_to_index:
+            user_idx = user_id_to_index[user_id]
+            user_vector = sparse_matrix[user_idx]
+            already_viewed = user_vector.indices
+            for col_idx in already_viewed:
+                art_global_id = article_ids_cf[col_idx]
+                if 0 <= art_global_id < NUM_ARTICLES_GLOBAL:
+                    scores_cb[art_global_id] = -9999
 
-    # Normalisation
-    scores_cf = min_max_scale(scores_cf)
-    scores_cb = min_max_scale(scores_cb)
+        # Normalisation
+        scores_cf = min_max_scale(scores_cf)
+        scores_cb = min_max_scale(scores_cb)
 
-    # Combinaison
-    scores_hybrid = alpha * scores_cf + (1 - alpha) * scores_cb
+        # Combinaison
+        scores_hybrid = alpha * scores_cf + (1 - alpha) * scores_cb
 
-    # Tri
-    sorted_indices = np.argsort(-scores_hybrid)
-    top_indices = sorted_indices[:top_n]
+        # Tri
+        sorted_indices = np.argsort(-scores_hybrid)
+        top_indices = sorted_indices[:top_n]
 
-    # Convertit en int
-    final_recos = [int(i) for i in top_indices]
+        # Convertit en int
+        final_recos = [int(i) for i in top_indices]
 
-    if not return_scores:
-        return final_recos
+        if not return_scores:
+            return final_recos
 
-    recommendations_data = []
-    for idx in top_indices:
-        part_cf = alpha * scores_cf[idx]
-        part_cb = (1 - alpha) * scores_cb[idx]
-        total = scores_hybrid[idx]
-        recommendations_data.append({
-            "article_id": int(idx),
-            "score_cf_part": float(part_cf),
-            "score_cb_part": float(part_cb),
-            "score_total": float(total)
-        })
-    return recommendations_data
+        recommendations_data = []
+        for idx in top_indices:
+            part_cf = alpha * scores_cf[idx]
+            part_cb = (1 - alpha) * scores_cb[idx]
+            total = scores_hybrid[idx]
+            recommendations_data.append({
+                "article_id": int(idx),
+                "score_cf_part": float(part_cf),
+                "score_cb_part": float(part_cb),
+                "score_total": float(total)
+            })
+        return recommendations_data
+
+    except Exception as e:
+        logging.error(f"Erreur dans predict_hybrid_recos : {str(e)}", exc_info=True)
+        raise
 
 # Function Azure - route="/recommend"
-@app.route(route="recommend", auth_level=AuthLevel.FUNCTION)
+@app.route(route="recommend", auth_level=AuthLevel.ANONYMOUS)
 def recommend_function(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("Recommandation Hybride CF+CB : début")
     try:
-        # Récup user_id
         user_id_str = req.params.get('user_id')
-        if not user_id_str:
-            try:
-                body = req.get_json()
-                user_id_str = body.get('user_id')
-            except:
-                pass
         if not user_id_str:
             return func.HttpResponse("Missing user_id", status_code=400)
         user_id = int(user_id_str)
 
-        # Vérification si user_id existe
         if user_id not in user_id_to_index and user_id not in user_profiles:
             return func.HttpResponse(
                 json.dumps({"error": f"L'utilisateur {user_id} est inconnu."}),
@@ -186,27 +221,51 @@ def recommend_function(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
 
-        # alpha
+        # Récupération de alpha avec validation
         alpha_str = req.params.get('alpha')
-        alpha = float(alpha_str) if alpha_str else 0.5
+        alpha = 0.5  # Valeur par défaut
 
-        # Calcul
+        if alpha_str:
+            try:
+                alpha = float(alpha_str)
+                if not (0 <= alpha <= 1):
+                    return func.HttpResponse(
+                        json.dumps({"error": "alpha must be between 0 and 1."}),
+                        status_code=400,
+                        mimetype="application/json"
+                    )
+            except ValueError:
+                if model_cf is None or model_cb is None:
+                    logging.error("Échec du chargement des modèles CF/CB")
+                return func.HttpResponse(
+                    json.dumps({"error": "Invalid alpha value. Must be a number between 0 and 1."}),
+                    status_code=400,
+                    mimetype="application/json"
+                )
+
+        # Calcul des recommandations hybrides
         final_recos = predict_hybrid_recos(user_id, alpha=alpha, top_n=5, return_scores=False)
+
+        # Structuration du JSON de réponse
         response_data = {
             "user_id": user_id,
             "recommendations": final_recos
-            }
+        }
 
         return func.HttpResponse(
             status_code=200,
-            body=json.dumps(response_data),
+            body=json.dumps(response_data, indent=2),
             mimetype="application/json"
         )
 
     except Exception as e:
-        logging.error(f"Erreur: {str(e)}", exc_info=True)
+        import traceback
+        error_message = traceback.format_exc()  # Récupère toute la stack trace
+
+        logging.error(f"Erreur complète : {error_message}")
+
         return func.HttpResponse(
             status_code=500,
-            body=json.dumps({"error": str(e)}),
+            body=json.dumps({"error": str(e), "details": error_message}),
             mimetype="application/json"
         )
